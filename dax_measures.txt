@@ -1,0 +1,493 @@
+================================================================================
+DAX MEASURES — Inventory Optimization & Demand Analysis
+================================================================================
+
+28 measures in 7 folders. Create a blank table named _Measures
+(Home > Enter data > name it "_Measures" > Load), then add every measure to it
+so they sit together in the field list instead of scattered across tables.
+
+Every measure below is basic-to-intermediate DAX: CALCULATE, DIVIDE, filter
+arguments, a couple of iterators, and two time-intelligence functions. Nothing
+here needs explaining twice in an interview.
+
+Formatting: currency measures $#,##0 · unit counts #,##0 · ratios 0.00 ·
+percentages 0.0%.
+
+
+================================================================================
+FOLDER 1 — SALES & DEMAND
+================================================================================
+
+--------------------------------------------------------------------------------
+Total Revenue
+--------------------------------------------------------------------------------
+Total Revenue =
+SUM ( FactInventory[Revenue] )
+
+Net sales value: units sold x price x (1 - discount). Revenue is computed in
+Power Query rather than here, so the discount logic lives in one place.
+
+--------------------------------------------------------------------------------
+Total Units Sold
+--------------------------------------------------------------------------------
+Total Units Sold =
+SUM ( FactInventory[Units_Sold] )
+
+Total unit volume. The primary demand measure.
+
+--------------------------------------------------------------------------------
+Avg Daily Demand
+--------------------------------------------------------------------------------
+Avg Daily Demand =
+DIVIDE (
+    [Total Units Sold],
+    DISTINCTCOUNT ( FactInventory[Date_Key] )
+)
+
+Units sold per day in the current filter context. DIVIDE rather than "/" so an
+empty selection returns blank instead of an error.
+
+--------------------------------------------------------------------------------
+Avg Daily Demand per SKU
+--------------------------------------------------------------------------------
+Avg Daily Demand per SKU =
+DIVIDE (
+    [Avg Daily Demand],
+    DISTINCTCOUNT ( FactInventory[SKU_Key] )
+)
+
+Per-position demand rate. Roughly 136 units across the whole panel. This is the
+denominator behind every cover calculation.
+
+--------------------------------------------------------------------------------
+Revenue YoY %
+--------------------------------------------------------------------------------
+Revenue YoY % =
+VAR CurrentRevenue = [Total Revenue]
+VAR PriorRevenue =
+    CALCULATE ( [Total Revenue], SAMEPERIODLASTYEAR ( DimDate[Date] ) )
+RETURN
+    DIVIDE ( CurrentRevenue - PriorRevenue, PriorRevenue )
+
+Year-on-year revenue growth. The panel holds two full years, so this is
+computable. It comes out near -1%, i.e. flat: worth reporting as a finding
+rather than hiding because it is not a growth story.
+
+--------------------------------------------------------------------------------
+Units Sold MoM %
+--------------------------------------------------------------------------------
+Units Sold MoM % =
+VAR CurrentUnits = [Total Units Sold]
+VAR PriorUnits =
+    CALCULATE ( [Total Units Sold], DATEADD ( DimDate[Date], -1, MONTH ) )
+RETURN
+    DIVIDE ( CurrentUnits - PriorUnits, PriorUnits )
+
+Month-on-month demand change. Filter visuals to Is_Complete_Month = 1 so the
+single day in January 2024 does not read as a collapse.
+
+
+================================================================================
+FOLDER 2 — INVENTORY POSITION
+================================================================================
+
+--------------------------------------------------------------------------------
+Inventory Value
+--------------------------------------------------------------------------------
+Inventory Value =
+AVERAGEX (
+    VALUES ( FactInventory[Date_Key] ),
+    CALCULATE ( SUM ( FactInventory[Inventory_Value] ) )
+)
+
+Average stock value on hand on a given day, at RETAIL price. The source file
+has no cost column, so a cost-based valuation is not available and every
+inventory-value figure in this report is a retail figure.
+
+AVERAGEX over dates, not a plain SUM: inventory is a stock measure, not a flow.
+Summing it across 731 days would produce a number 731 times too large.
+
+--------------------------------------------------------------------------------
+Avg Inventory Units
+--------------------------------------------------------------------------------
+Avg Inventory Units =
+AVERAGE ( FactInventory[Inventory_Level] )
+
+Average units on hand per position-day.
+
+--------------------------------------------------------------------------------
+Avg Days of Cover
+--------------------------------------------------------------------------------
+Avg Days of Cover =
+AVERAGE ( FactInventory[Days_of_Cover] )
+
+How many days current stock would last at the recent demand rate. The core
+metric of this project, because it is the one dimension in this dataset with
+genuine variation (0.34 to 3.95 days).
+
+--------------------------------------------------------------------------------
+Inventory Turnover
+--------------------------------------------------------------------------------
+Inventory Turnover =
+VAR DaysInContext = DISTINCTCOUNT ( FactInventory[Date_Key] )
+RETURN
+    DIVIDE (
+        [Total Units Sold] * 365.25,
+        [Avg Inventory Units] * DISTINCTCOUNT ( FactInventory[SKU_Key] ) * DaysInContext
+    )
+
+Annualised turns: units sold per unit of average inventory, scaled to a year.
+Lands near 180x, which is high but correct for a profile carrying about two
+days of cover. Measured in units, not cost of goods sold, because no cost
+column exists.
+
+--------------------------------------------------------------------------------
+Total Excess Value
+--------------------------------------------------------------------------------
+Total Excess Value =
+AVERAGEX (
+    VALUES ( FactInventory[Date_Key] ),
+    CALCULATE ( SUM ( FactInventory[Excess_Value] ) )
+)
+
+Average daily capital tied up in stock above the 3-day target cover. Same
+stock-measure reasoning as Inventory Value.
+
+--------------------------------------------------------------------------------
+Excess as % of Inventory
+--------------------------------------------------------------------------------
+Excess as % of Inventory =
+DIVIDE ( [Total Excess Value], [Inventory Value] )
+
+Share of inventory value that is above target cover. Around 4% system-wide.
+
+
+================================================================================
+FOLDER 3 — STOCK STATUS COUNTS
+================================================================================
+
+These count POSITION-DAYS, not products. A store-product on one date is one
+position-day. The dataset holds 73,100 of them.
+
+--------------------------------------------------------------------------------
+Critical Position Days
+--------------------------------------------------------------------------------
+Critical Position Days =
+CALCULATE (
+    COUNTROWS ( FactInventory ),
+    FactInventory[Stock_Status] = "Critical"
+)
+
+Position-days below one day of cover.
+
+--------------------------------------------------------------------------------
+Below Reorder Position Days
+--------------------------------------------------------------------------------
+Below Reorder Position Days =
+CALCULATE (
+    COUNTROWS ( FactInventory ),
+    FactInventory[Stock_Status] IN { "Critical", "Below Reorder" }
+)
+
+Position-days at or under the reorder point. Critical is included because a
+position below one day of cover is also below the reorder point.
+
+--------------------------------------------------------------------------------
+Excess Position Days
+--------------------------------------------------------------------------------
+Excess Position Days =
+CALCULATE (
+    COUNTROWS ( FactInventory ),
+    FactInventory[Stock_Status] = "Excess"
+)
+
+--------------------------------------------------------------------------------
+Healthy Position Days
+--------------------------------------------------------------------------------
+Healthy Position Days =
+CALCULATE (
+    COUNTROWS ( FactInventory ),
+    FactInventory[Stock_Status] = "Healthy"
+)
+
+--------------------------------------------------------------------------------
+Critical Rate %
+--------------------------------------------------------------------------------
+Critical Rate % =
+DIVIDE ( [Critical Position Days], COUNTROWS ( FactInventory ) )
+
+Share of position-days at critical cover. About 18.7% system-wide.
+
+--------------------------------------------------------------------------------
+Excess Rate %
+--------------------------------------------------------------------------------
+Excess Rate % =
+DIVIDE ( [Excess Position Days], COUNTROWS ( FactInventory ) )
+
+About 19.1% system-wide.
+
+
+================================================================================
+FOLDER 4 — SERVICE RISK
+================================================================================
+
+--------------------------------------------------------------------------------
+Stockout Risk Days
+--------------------------------------------------------------------------------
+Stockout Risk Days =
+SUM ( FactInventory[Stockout_Risk] )
+
+Position-days where forecast demand exceeded stock on hand. 2,585 across the
+panel, or 3.5%.
+
+--------------------------------------------------------------------------------
+Sold Out Days
+--------------------------------------------------------------------------------
+Sold Out Days =
+SUM ( FactInventory[Sold_Out] )
+
+Position-days that ended with every unit gone. On those days true demand was
+censored: actual demand could have been higher than the units recorded.
+
+--------------------------------------------------------------------------------
+Unserved Units
+--------------------------------------------------------------------------------
+Unserved Units =
+SUM ( FactInventory[Unserved_Units] )
+
+Forecast demand the position could not have covered. About 17,300 units.
+
+--------------------------------------------------------------------------------
+Unserved Revenue at Risk
+--------------------------------------------------------------------------------
+Unserved Revenue at Risk =
+SUMX (
+    FactInventory,
+    FactInventory[Unserved_Units] * FactInventory[Price]
+)
+
+Retail value of that unserved demand. About $952,000 across two years.
+SUMX because the calculation is row-by-row: each row has its own price.
+
+--------------------------------------------------------------------------------
+Service Level %
+--------------------------------------------------------------------------------
+Service Level % =
+DIVIDE (
+    COUNTROWS ( FactInventory ) - [Stockout Risk Days],
+    COUNTROWS ( FactInventory )
+)
+
+Share of position-days where stock on hand covered forecast demand. Near 96.5%.
+
+
+================================================================================
+FOLDER 5 — FORECAST QUALITY
+================================================================================
+
+--------------------------------------------------------------------------------
+Forecast Bias
+--------------------------------------------------------------------------------
+Forecast Bias =
+AVERAGE ( FactInventory[Forecast_Error] )
+
+Mean of forecast minus actual. Positive means the supplied forecast runs above
+what sold. Sits at +5.03 units per position-day across the whole panel — a
+systematic bias, not random error, and one of the strongest findings here.
+
+--------------------------------------------------------------------------------
+Forecast MAE
+--------------------------------------------------------------------------------
+Forecast MAE =
+AVERAGE ( FactInventory[Abs_Forecast_Error] )
+
+Mean absolute error: average forecast miss regardless of direction, 8.34 units.
+That MAE exceeds the bias tells you the error is mostly systematic.
+
+--------------------------------------------------------------------------------
+Forecast MAPE %
+--------------------------------------------------------------------------------
+Forecast MAPE % =
+DIVIDE ( [Forecast MAE], [Avg Daily Demand per SKU] )
+
+Mean absolute error as a share of average demand. About 6.1%.
+
+--------------------------------------------------------------------------------
+Over-Forecast Rate %
+--------------------------------------------------------------------------------
+Over-Forecast Rate % =
+DIVIDE (
+    CALCULATE ( COUNTROWS ( FactInventory ), FactInventory[Forecast_Error] > 0 ),
+    COUNTROWS ( FactInventory )
+)
+
+Share of position-days where the forecast came in above actual sales. 66.7%.
+A well-calibrated forecast would sit near 50%.
+
+
+================================================================================
+FOLDER 6 — REPLENISHMENT DISCIPLINE
+================================================================================
+
+The measures that carry the project's headline finding.
+
+--------------------------------------------------------------------------------
+Total Units Ordered
+--------------------------------------------------------------------------------
+Total Units Ordered =
+SUM ( FactInventory[Units_Ordered] )
+
+--------------------------------------------------------------------------------
+Order Requirement
+--------------------------------------------------------------------------------
+Order Requirement =
+SUM ( FactInventory[Order_Requirement] )
+
+Units that would have been needed to bring every position to target cover.
+
+--------------------------------------------------------------------------------
+Order Gap
+--------------------------------------------------------------------------------
+Order Gap =
+[Total Units Ordered] - [Order Requirement]
+
+Ordered minus required. Negative = under-ordering against need; positive =
+over-ordering. Read it alongside Stock Status: the gap runs in both directions
+at once, which is what random ordering looks like.
+
+--------------------------------------------------------------------------------
+Units Ordered into Excess
+--------------------------------------------------------------------------------
+Units Ordered into Excess =
+CALCULATE (
+    [Total Units Ordered],
+    FactInventory[Stock_Status] = "Excess"
+)
+
+Units ordered into positions already above target cover. About 1.54 million
+units, roughly $85 million at retail, across the two years. The single most
+quotable number in the project.
+
+--------------------------------------------------------------------------------
+Avg Order When Critical
+--------------------------------------------------------------------------------
+Avg Order When Critical =
+CALCULATE (
+    AVERAGE ( FactInventory[Units_Ordered] ),
+    FactInventory[Stock_Status] = "Critical"
+)
+
+--------------------------------------------------------------------------------
+Avg Order When Excess
+--------------------------------------------------------------------------------
+Avg Order When Excess =
+CALCULATE (
+    AVERAGE ( FactInventory[Units_Ordered] ),
+    FactInventory[Stock_Status] = "Excess"
+)
+
+Put these two side by side on a card. They come out at 110.1 and 110.4 units.
+A responsive ordering process would show a large gap between them; an identical
+pair is the finding.
+
+
+================================================================================
+FOLDER 7 — HELPERS
+================================================================================
+
+--------------------------------------------------------------------------------
+Latest Date
+--------------------------------------------------------------------------------
+Latest Date =
+MAX ( FactInventory[Date] )
+
+--------------------------------------------------------------------------------
+Positions Needing Action
+--------------------------------------------------------------------------------
+Positions Needing Action =
+CALCULATE (
+    DISTINCTCOUNT ( FactInventory[SKU_Key] ),
+    FactInventory[Stock_Status] IN { "Critical", "Below Reorder" },
+    FactInventory[Date] = [Latest Date]
+)
+
+Distinct positions requiring replenishment on the most recent date. 37 of 100
+on 2024-01-01.
+
+--------------------------------------------------------------------------------
+Selected Cover Threshold
+--------------------------------------------------------------------------------
+Selected Cover Threshold =
+SELECTEDVALUE ( 'Cover Threshold'[Cover Threshold], 3 )
+
+Reads the what-if parameter described below. Defaults to 3 days when nothing
+is selected.
+
+--------------------------------------------------------------------------------
+Excess at Selected Threshold
+--------------------------------------------------------------------------------
+Excess at Selected Threshold =
+VAR Threshold = [Selected Cover Threshold]
+RETURN
+    AVERAGEX (
+        VALUES ( FactInventory[Date_Key] ),
+        CALCULATE (
+            SUMX (
+                FactInventory,
+                MAX ( 0,
+                      FactInventory[Inventory_Level]
+                      - FactInventory[Avg_Daily_Demand] * Threshold )
+                * FactInventory[Price]
+            )
+        )
+    )
+
+Recalculates excess capital as the user drags the target-cover slider. This is
+what turns page 3 from a report into a decision tool: the manager sees the
+capital released at 2 days of cover versus 4.
+
+
+================================================================================
+WHAT-IF PARAMETER SETUP
+================================================================================
+
+Modeling > New parameter > Numeric range
+  Name:      Cover Threshold
+  Data type: Decimal number
+  Minimum:   0.5
+  Maximum:   6.0
+  Increment: 0.5
+  Default:   3.0
+  Tick "Add slicer to this page"
+
+This creates a table named 'Cover Threshold' with a column of the same name,
+which the two measures above read.
+
+
+================================================================================
+MEASURES DELIBERATELY NOT BUILT
+================================================================================
+
+Each of these appeared in the original project brief and is impossible or
+misleading against this dataset. Being able to say why is worth more in an
+interview than a measure that returns a plausible wrong number.
+
+  Gross Margin / Margin %       No cost column. Only retail price exists.
+  Inventory Value at Cost       Same reason.
+  Supplier On-Time Rate         No supplier column.
+  Lead Time Variance            No lead time column.
+  Days of Supply by Warehouse   No warehouse column. Store is the only real
+                                location field.
+  Sales by Category (as a       Category varies row to row within the same
+  demand driver)                store-product, so it is a transaction label,
+                                not a product attribute. Usable as a
+                                descriptive split, never as a driver.
+  Regional Demand Index         Region has the same defect.
+  Promotion Uplift %            Promotion days average 136.4 units against
+                                136.5 on non-promotion days (p = 0.92).
+                                There is no uplift to measure.
+  Discount Elasticity           Demand is flat across all five discount tiers
+                                (p = 0.46).
+  Fast/Slow Moving Rank         Demand differences across the 100 positions
+                                are within sampling noise (max |z| = 2.99 over
+                                100 groups). Ranking them would rank noise.

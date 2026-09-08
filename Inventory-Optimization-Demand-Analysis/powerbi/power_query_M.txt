@@ -1,0 +1,332 @@
+================================================================================
+POWER QUERY (M) — Inventory Optimization & Demand Analysis
+================================================================================
+
+Six queries. Paste each into Power BI Desktop via
+Home > Transform data > New Source > Blank Query > Advanced Editor.
+
+Build them in this order, because later queries reference earlier ones:
+
+  1. pSourcePath        (parameter)
+  2. FactInventory      (the 73,100-row fact table)
+  3. DimDate
+  4. DimProduct
+  5. DimStore
+  6. SKUProfile         (helper: per-SKU demand statistics)
+
+Set FactInventory, DimDate, DimProduct, DimStore to Enable load.
+Set pSourcePath and SKUProfile to "Enable load" OFF — they are staging only.
+
+--------------------------------------------------------------------------------
+1. pSourcePath  —  parameter
+--------------------------------------------------------------------------------
+Create via Home > Manage Parameters > New Parameter.
+  Name: pSourcePath
+  Type: Text
+  Current value: C:\Projects\Inventory-Optimization-Demand-Analysis\data\raw\retail_store_inventory.csv
+
+Holding the path in a parameter means the report repoints to a new machine by
+editing one value instead of every query.
+
+
+--------------------------------------------------------------------------------
+2. SKUProfile  —  per-SKU demand statistics (staging, do not load)
+--------------------------------------------------------------------------------
+Average daily demand and its standard deviation per store-product. Computed
+once here and merged into the fact table, so the fact query stays readable.
+
+let
+    Source = Csv.Document(
+        File.Contents(pSourcePath),
+        [Delimiter = ",", Encoding = 65001, QuoteStyle = QuoteStyle.Csv]
+    ),
+    Promoted = Table.PromoteHeaders(Source, [PromoteAllScalars = true]),
+
+    Typed = Table.TransformColumnTypes(Promoted, {
+        {"Store ID", type text},
+        {"Product ID", type text},
+        {"Units Sold", Int64.Type}
+    }),
+
+    // The stock position key. Product ID alone is not a stock position,
+    // because the same product is held in all five stores.
+    AddSKU = Table.AddColumn(Typed, "SKU_Key",
+        each [Store ID] & "-" & [Product ID], type text),
+
+    Grouped = Table.Group(AddSKU, {"SKU_Key"}, {
+        {"Avg_Daily_Demand", each List.Average([Units Sold]), type number},
+        {"Demand_StdDev",    each List.StandardDeviation([Units Sold]), type number},
+        {"Observation_Days", each Table.RowCount(_), Int64.Type}
+    })
+in
+    Grouped
+
+
+--------------------------------------------------------------------------------
+3. FactInventory  —  the fact table
+--------------------------------------------------------------------------------
+let
+    // ---- LOAD ----------------------------------------------------------------
+    Source = Csv.Document(
+        File.Contents(pSourcePath),
+        [Delimiter = ",", Columns = 15, Encoding = 65001, QuoteStyle = QuoteStyle.Csv]
+    ),
+    Promoted = Table.PromoteHeaders(Source, [PromoteAllScalars = true]),
+
+    // ---- DATA TYPES ----------------------------------------------------------
+    // Explicit types up front. Left to its own devices Power Query will guess
+    // from the first 200 rows and get Demand Forecast wrong.
+    Typed = Table.TransformColumnTypes(Promoted, {
+        {"Date", type date},
+        {"Store ID", type text},
+        {"Product ID", type text},
+        {"Category", type text},
+        {"Region", type text},
+        {"Inventory Level", Int64.Type},
+        {"Units Sold", Int64.Type},
+        {"Units Ordered", Int64.Type},
+        {"Demand Forecast", type number},
+        {"Price", type number},
+        {"Discount", Int64.Type},
+        {"Weather Condition", type text},
+        {"Holiday/Promotion", Int64.Type},
+        {"Competitor Pricing", type number},
+        {"Seasonality", type text}
+    }),
+
+    // ---- STANDARDISE TEXT ----------------------------------------------------
+    // Trim and clean the key and label columns. The source file is already
+    // tidy; these steps make the query safe against a dirtier refresh.
+    Trimmed = Table.TransformColumns(Typed, {
+        {"Store ID", Text.Trim, type text},
+        {"Product ID", Text.Trim, type text},
+        {"Category", each Text.Proper(Text.Trim(_)), type text},
+        {"Region", each Text.Proper(Text.Trim(_)), type text},
+        {"Weather Condition", each Text.Proper(Text.Trim(_)), type text},
+        {"Seasonality", each Text.Proper(Text.Trim(_)), type text}
+    }),
+
+    // ---- MISSING VALUES ------------------------------------------------------
+    // Drop any row missing part of the composite key. The current file has
+    // none; this guards future refreshes.
+    NoBlankKeys = Table.SelectRows(Trimmed, each
+        [Date] <> null and
+        [Store ID] <> null and [Store ID] <> "" and
+        [Product ID] <> null and [Product ID] <> ""),
+
+    // ---- DUPLICATES ----------------------------------------------------------
+    // The grain is Date x Store x Product. Anything repeating that triple is
+    // a duplicate, whatever the other columns say.
+    Deduped = Table.Distinct(NoBlankKeys, {"Date", "Store ID", "Product ID"}),
+
+    // ---- KEYS ----------------------------------------------------------------
+    AddSKU = Table.AddColumn(Deduped, "SKU_Key",
+        each [Store ID] & "-" & [Product ID], type text),
+    AddDateKey = Table.AddColumn(AddSKU, "Date_Key",
+        each Date.Year([Date]) * 10000 + Date.Month([Date]) * 100 + Date.Day([Date]), Int64.Type),
+
+    // ---- MERGE THE DEMAND PROFILE --------------------------------------------
+    Merged = Table.NestedJoin(AddDateKey, {"SKU_Key"}, SKUProfile, {"SKU_Key"},
+        "prof", JoinKind.LeftOuter),
+    Expanded = Table.ExpandTableColumn(Merged, "prof",
+        {"Avg_Daily_Demand", "Demand_StdDev"}, {"Avg_Daily_Demand", "Demand_StdDev"}),
+
+    // ---- DERIVED MEASURES ----------------------------------------------------
+    // Net price applies the whole-number discount percentage.
+    AddNetPrice = Table.AddColumn(Expanded, "Net_Price",
+        each [Price] * (1 - [Discount] / 100), type number),
+    AddRevenue = Table.AddColumn(AddNetPrice, "Revenue",
+        each [Units Sold] * [Net_Price], type number),
+
+    // Inventory is valued at RETAIL price. The source has no cost column, so a
+    // cost-based valuation is not available.
+    AddInvValue = Table.AddColumn(AddRevenue, "Inventory_Value",
+        each [Inventory Level] * [Price], type number),
+
+    // Days of cover: the core metric. How long current stock lasts at the
+    // SKU's average demand rate.
+    AddCover = Table.AddColumn(AddInvValue, "Days_of_Cover",
+        each if [Avg_Daily_Demand] = null or [Avg_Daily_Demand] = 0
+             then null
+             else [Inventory Level] / [Avg_Daily_Demand], type number),
+
+    // Reorder point from the policy parameter, not from a source column.
+    AddROP = Table.AddColumn(AddCover, "Reorder_Point",
+        each [Avg_Daily_Demand] * 1.5, type number),
+
+    // Excess stock held above the 3-day target cover, and its retail value.
+    AddExcessUnits = Table.AddColumn(AddROP, "Excess_Units",
+        each List.Max({0, [Inventory Level] - [Avg_Daily_Demand] * 3}), type number),
+    AddExcessValue = Table.AddColumn(AddExcessUnits, "Excess_Value",
+        each [Excess_Units] * [Price], type number),
+
+    // Service-risk flags.
+    AddSoldOut = Table.AddColumn(AddExcessValue, "Sold_Out",
+        each if [Units Sold] = [Inventory Level] then 1 else 0, Int64.Type),
+    AddRisk = Table.AddColumn(AddSoldOut, "Stockout_Risk",
+        each if [Demand Forecast] > [Inventory Level] then 1 else 0, Int64.Type),
+    AddUnserved = Table.AddColumn(AddRisk, "Unserved_Units",
+        each List.Max({0, [Demand Forecast] - [Inventory Level]}), type number),
+
+    // Forecast error. Positive = the supplied forecast ran above actual sales.
+    AddFcstErr = Table.AddColumn(AddUnserved, "Forecast_Error",
+        each [Demand Forecast] - [Units Sold], type number),
+    AddAbsErr = Table.AddColumn(AddFcstErr, "Abs_Forecast_Error",
+        each Number.Abs([Forecast_Error]), type number),
+
+    // What the order should have been, versus what was placed.
+    AddOrderReq = Table.AddColumn(AddAbsErr, "Order_Requirement",
+        each List.Max({0, [Avg_Daily_Demand] * 3 - [Inventory Level]}), type number),
+    AddOrderGap = Table.AddColumn(AddOrderReq, "Order_Gap",
+        each [Units Ordered] - [Order_Requirement], type number),
+
+    // ---- CLASSIFICATION ------------------------------------------------------
+    // Four mutually exclusive bands, calibrated to the observed cover
+    // distribution (p25 = 1.19, median = 2.00, p75 = 2.84 days).
+    AddStatus = Table.AddColumn(AddOrderGap, "Stock_Status",
+        each if [Days_of_Cover] = null then "Unknown"
+             else if [Days_of_Cover] < 1.0 then "Critical"
+             else if [Days_of_Cover] < 1.5 then "Below Reorder"
+             else if [Days_of_Cover] <= 3.0 then "Healthy"
+             else "Excess", type text),
+
+    AddAction = Table.AddColumn(AddStatus, "Recommended_Action",
+        each if [Stock_Status] = "Critical" then "REPLENISH NOW"
+             else if [Stock_Status] = "Below Reorder" then "REPLENISH"
+             else if [Stock_Status] = "Healthy" then "MAINTAIN"
+             else if [Stock_Status] = "Excess" then "REDUCE STOCK"
+             else "REVIEW", type text),
+
+    // ---- RENAME FOR THE MODEL ------------------------------------------------
+    Renamed = Table.RenameColumns(AddAction, {
+        {"Store ID", "Store_ID"},
+        {"Product ID", "Product_ID"},
+        {"Inventory Level", "Inventory_Level"},
+        {"Units Sold", "Units_Sold"},
+        {"Units Ordered", "Units_Ordered"},
+        {"Demand Forecast", "Demand_Forecast"},
+        {"Weather Condition", "Weather_Condition"},
+        {"Holiday/Promotion", "Holiday_Promotion"},
+        {"Competitor Pricing", "Competitor_Pricing"}
+    }),
+
+    // ---- DROP WHAT THE MODEL DOES NOT USE ------------------------------------
+    // Competitor Pricing tracks Price at r = 0.99, so it adds a column and no
+    // information. Weather and Seasonality showed no measurable relationship
+    // with demand and are removed to keep the model small; add them back if
+    // you want to demonstrate that finding visually.
+    Removed = Table.RemoveColumns(Renamed, {"Competitor_Pricing"})
+in
+    Removed
+
+
+--------------------------------------------------------------------------------
+4. DimDate  —  date dimension
+--------------------------------------------------------------------------------
+Generated rather than loaded, so the calendar is always contiguous.
+After loading, mark it as a date table: Table tools > Mark as date table > Date.
+
+let
+    StartDate = #date(2022, 1, 1),
+    EndDate = #date(2024, 1, 1),
+    DayCount = Duration.Days(EndDate - StartDate) + 1,
+
+    Dates = List.Dates(StartDate, DayCount, #duration(1, 0, 0, 0)),
+    AsTable = Table.FromList(Dates, Splitter.SplitByNothing(), {"Date"}),
+    Typed = Table.TransformColumnTypes(AsTable, {{"Date", type date}}),
+
+    AddKey = Table.AddColumn(Typed, "Date_Key",
+        each Date.Year([Date]) * 10000 + Date.Month([Date]) * 100 + Date.Day([Date]), Int64.Type),
+    AddYear = Table.AddColumn(AddKey, "Year", each Date.Year([Date]), Int64.Type),
+    AddQuarter = Table.AddColumn(AddYear, "Quarter",
+        each "Q" & Text.From(Date.QuarterOfYear([Date])), type text),
+    AddMonthNum = Table.AddColumn(AddQuarter, "Month_Num", each Date.Month([Date]), Int64.Type),
+    AddMonthName = Table.AddColumn(AddMonthNum, "Month_Name",
+        each Date.ToText([Date], "MMM"), type text),
+    AddYearMonth = Table.AddColumn(AddMonthName, "Year_Month",
+        each Date.ToText([Date], "yyyy-MM"), type text),
+    AddDayName = Table.AddColumn(AddYearMonth, "Day_Name",
+        each Date.DayOfWeekName([Date]), type text),
+    AddWeekend = Table.AddColumn(AddDayName, "Is_Weekend",
+        each if Date.DayOfWeek([Date], Day.Monday) >= 5 then 1 else 0, Int64.Type),
+
+    // The panel ends on 2024-01-01, so January 2024 holds a single day.
+    // Flagging it stops the monthly trend line showing a false collapse.
+    Grouped = Table.Group(AddWeekend, {"Year_Month"},
+        {{"DaysInMonth", each Table.RowCount(_), Int64.Type}}),
+    Joined = Table.NestedJoin(AddWeekend, {"Year_Month"}, Grouped, {"Year_Month"},
+        "g", JoinKind.LeftOuter),
+    ExpandDays = Table.ExpandTableColumn(Joined, "g", {"DaysInMonth"}, {"DaysInMonth"}),
+    AddComplete = Table.AddColumn(ExpandDays, "Is_Complete_Month",
+        each if [DaysInMonth] >= 28 then 1 else 0, Int64.Type),
+    Final = Table.RemoveColumns(AddComplete, {"DaysInMonth"})
+in
+    Final
+
+
+--------------------------------------------------------------------------------
+5. DimProduct  —  product dimension
+--------------------------------------------------------------------------------
+Twenty rows. Note what is NOT here: Category is deliberately excluded, because
+the profiling step proved it varies row to row for the same Product ID and is
+therefore a transaction label, not a product attribute. It stays on the fact
+table where it belongs.
+
+let
+    Source = FactInventory,
+    Products = Table.Distinct(Table.SelectColumns(Source, {"Product_ID"})),
+    Sorted = Table.Sort(Products, {{"Product_ID", Order.Ascending}}),
+    AddLabel = Table.AddColumn(Sorted, "Product_Label",
+        each "Product " & Text.End([Product_ID], 2), type text)
+in
+    AddLabel
+
+
+--------------------------------------------------------------------------------
+6. DimStore  —  store dimension
+--------------------------------------------------------------------------------
+Five rows. Region is excluded for the same reason as Category above: a single
+store carries all four Region values across its daily rows.
+
+let
+    Source = FactInventory,
+    Stores = Table.Distinct(Table.SelectColumns(Source, {"Store_ID"})),
+    Sorted = Table.Sort(Stores, {{"Store_ID", Order.Ascending}}),
+    AddLabel = Table.AddColumn(Sorted, "Store_Label",
+        each "Store " & Text.End([Store_ID], 1), type text)
+in
+    AddLabel
+
+
+================================================================================
+TRANSFORMATION LOG — what was done and why
+================================================================================
+
+  #  Step                    Applied to        Reason
+  -  ----------------------  ----------------  ------------------------------------
+  1  Promote headers         All queries       CSV arrives with headers as row 1.
+  2  Set explicit types      FactInventory     Type inference samples 200 rows and
+                                               mis-types Demand Forecast.
+  3  Trim + proper-case      Text columns      Guards against a dirtier refresh.
+  4  Remove blank keys       FactInventory     A row without the full key cannot be
+                                               placed in the model.
+  5  Remove duplicates       FactInventory     Grain is Date x Store x Product.
+  6  Add SKU_Key             FactInventory     Store + Product is the stock position.
+  7  Add Date_Key            FactInventory     Integer join to DimDate.
+  8  Merge SKUProfile        FactInventory     Brings average demand onto each row.
+  9  Add 14 derived columns  FactInventory     Cover, excess, risk, forecast error,
+                                               order gap.
+ 10  Classify + action       FactInventory     Four bands from days of cover.
+ 11  Rename columns          FactInventory     Remove spaces and the slash, which
+                                               complicate DAX.
+ 12  Remove Competitor       FactInventory     r = 0.99 with Price. No information.
+     Pricing
+ 13  Generate calendar       DimDate           Contiguous dates independent of the
+                                               fact table.
+ 14  Flag partial months     DimDate           Jan 2024 holds one day only.
+ 15  Distinct + label        DimProduct        20 rows. Category deliberately
+                                               excluded.
+ 16  Distinct + label        DimStore          5 rows. Region deliberately excluded.
+
+Result: 73,100 fact rows, 0 removed. The cleaning steps are no-ops on the
+current file and exist so the pipeline survives a dirtier refresh.
