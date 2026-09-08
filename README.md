@@ -346,3 +346,15 @@ Each of the following appeared in the original plan and was dropped once the dat
 | Machine learning demand forecasting | Demand is stationary with no usable predictors; a mean is the correct model |
 
 Each would produce numbers. None of the numbers would mean anything.
+
+## 👤 Author
+
+**Prakhar Chaudhary**
+
+- GitHub: [@Prakhar3518](https://github.com/Prakhar3518)
+- LinkedIn: [Prakhar Chaudhary](https://www.linkedin.com/in/prakhar-chaudharyy/)
+- Email: prakharchaudhary0302@gmail.com
+
+## 📄 License
+
+This project is open for educational and portfolio use. The dataset is Netflix movie metadata — attribute the original source appropriately if you redistribute it.
